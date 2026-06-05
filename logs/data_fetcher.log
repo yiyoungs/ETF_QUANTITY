@@ -1,0 +1,22 @@
+2026-06-05 14:01:18,385 - INFO - === 数据获取模块测试 ===
+2026-06-05 14:01:18,386 - INFO - 开始获取全市场 ETF 列表...
+2026-06-05 14:01:18,386 - ERROR - 获取 ETF 列表失败: module 'akshare' has no attribute 'fund_etf_info_em'
+2026-06-05 14:03:13,628 - INFO - === 数据获取模块测试 ===
+2026-06-05 14:03:13,628 - INFO - 开始获取全市场 ETF 列表...
+2026-06-05 14:03:14,904 - INFO - 成功获取 382 只 ETF
+2026-06-05 14:03:14,905 - INFO - ETF 池大小: 382
+2026-06-05 14:03:14,905 - INFO - 测试下载样本 ETF: 511010
+2026-06-05 14:03:14,905 - INFO - 开始下载 ETF 511010 的历史数据 (2015-01-01 ~ 2026-06-05)
+2026-06-05 14:03:16,869 - WARNING - ETF 511010 无数据返回
+2026-06-05 14:03:16,870 - INFO - === 测试完成 ===
+2026-06-05 14:27:21,738 - INFO - === 数据获取模块测试 ===
+2026-06-05 14:27:21,739 - INFO - 开始获取全市场 ETF 列表...
+2026-06-05 14:27:23,468 - INFO - 成功获取 382 只 ETF
+2026-06-05 14:27:23,468 - INFO - ETF 池大小: 382
+2026-06-05 14:27:23,468 - INFO - 测试下载样本 ETF: 511010
+2026-06-05 14:27:23,469 - INFO - 开始下载 ETF 511010 的历史数据 (2015-01-01 ~ 2026-06-05)
+2026-06-05 14:27:24,898 - WARNING - 下载 ETF 511010 失败 (尝试 1/3): ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-06-05 14:27:27,286 - WARNING - 下载 ETF 511010 失败 (尝试 2/3): ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-06-05 14:27:29,727 - WARNING - 下载 ETF 511010 失败 (尝试 3/3): ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-06-05 14:27:30,727 - ERROR - ETF 511010 下载失败，已达最大重试次数
+2026-06-05 14:27:30,729 - INFO - === 测试完成 ===

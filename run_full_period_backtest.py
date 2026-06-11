@@ -56,18 +56,34 @@ def load_core_etf_data(start_date, end_date):
     return all_data
 
 def create_etf_pool():
-    """创建ETF池"""
+    """创建ETF池 - 扩展版，覆盖更多行业和主题"""
     etf_info = {
+        # 宽基指数（6只）
         '510050': {'name': '50ETF', 'type': '宽基'},
         '510300': {'name': '沪深300ETF', 'type': '宽基'},
         '510500': {'name': '中证500ETF', 'type': '宽基'},
         '159915': {'name': '创业板ETF', 'type': '宽基'},
         '512100': {'name': '中证100ETF', 'type': '宽基'},
+        '512040': {'name': '中证红利ETF', 'type': '宽基'},
+        # 行业ETF（12只） - 覆盖主要申万一级行业
         '512660': {'name': '券商ETF', 'type': '行业'},
         '512480': {'name': '半导体ETF', 'type': '行业'},
         '512690': {'name': '酒ETF', 'type': '行业'},
         '512010': {'name': '医药ETF', 'type': '行业'},
-        '515030': {'name': '新能源ETF', 'type': '行业'},
+        '515030': {'name': '新能源车ETF', 'type': '行业'},
+        '510630': {'name': '消费ETF', 'type': '行业'},
+        '512670': {'name': '国防军工ETF', 'type': '行业'},
+        '512400': {'name': '有色金属ETF', 'type': '行业'},
+        '512170': {'name': '医疗ETF', 'type': '行业'},
+        '512800': {'name': '银行ETF', 'type': '行业'},
+        '512200': {'name': '房地产ETF', 'type': '行业'},
+        '515880': {'name': '通信ETF', 'type': '行业'},
+        # 主题ETF（5只）
+        '515980': {'name': '人工智能ETF', 'type': '主题'},
+        '515050': {'name': '5G ETF', 'type': '主题'},
+        '159992': {'name': '创新药ETF', 'type': '主题'},
+        '562530': {'name': '高端装备ETF', 'type': '主题'},
+        # 避险资产（2只）
         '511010': {'name': '国债ETF', 'type': '避险'},
         '518880': {'name': '黄金ETF', 'type': '避险'}
     }

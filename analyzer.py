@@ -161,11 +161,11 @@ class Analyzer:
         print(f"初始资金: {StrategyConfig.INITIAL_CAPITAL:,} 元")
         print(f"\n【核心指标】")
         print(f"  总收益率: {self.metrics['total_return']:.2f}%")
-        print(f"  年化收益率: {self.metrics['annual_return']:.2f}%")
-        print(f"  年化波动率: {self.metrics['annual_std']:.2f}%")
+        print(f"  年化收益率: {self.metrics['annualized_return'] * 100:.2f}%")
+        print(f"  年化波动率: {self.metrics['annualized_volatility'] * 100:.2f}%")
         print(f"  夏普比率: {self.metrics['sharpe_ratio']:.2f}")
-        print(f"  最大回撤: {self.metrics['max_drawdown']:.2f}%")
-        print(f"  胜率: {self.metrics['win_rate']:.2f}%")
+        print(f"  最大回撤: {self.metrics['max_drawdown'] * 100:.2f}%")
+        print(f"  胜率: {self.metrics['win_rate'] * 100:.2f}%")
         print(f"  盈亏比: {self.metrics['profit_factor']:.2f}")
 
 if __name__ == '__main__':

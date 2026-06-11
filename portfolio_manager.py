@@ -222,15 +222,18 @@ if __name__ == '__main__':
         'qfq': {
             '510050': pd.DataFrame({
                 'date': dates,
-                'close': np.linspace(2.0, 2.5, n_days)
+                'close': np.linspace(2.0, 2.5, n_days),
+                'amount': np.ones(n_days) * 200000000
             }),
             '510300': pd.DataFrame({
                 'date': dates,
-                'close': np.linspace(4.0, 5.0, n_days)
+                'close': np.linspace(4.0, 5.0, n_days),
+                'amount': np.ones(n_days) * 600000000
             }),
             '511010': pd.DataFrame({
                 'date': dates,
-                'close': np.linspace(100.0, 100.5, n_days)
+                'close': np.linspace(100.0, 100.5, n_days),
+                'amount': np.ones(n_days) * 500000000
             })
         },
         'hfq': {

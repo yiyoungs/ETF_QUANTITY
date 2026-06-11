@@ -38,6 +38,9 @@ class Backtester:
         
         # 风险控制：跟踪沪深300前期高点，用于回撤控制
         self.sp500_high_water_mark = 0.0  # 沪深300ETF前期高点
+        
+        # 风险控制：跟踪组合净值高点
+        self.nav_high_water_mark = 0.0  # 组合净值前期高点
     
     def _get_trading_dates(self):
         dates = set()
@@ -158,6 +161,7 @@ class Backtester:
             price_to_ma200_ratio = close_price / ma200_price if ma200_price > 0 else 1.0
             
             # 根据回撤程度逐步降低权益仓位
+            mode_text = ""
             if drawdown > 12.0 or price_to_ma200_ratio < 1.01:
                 new_exposure = 0.0
                 mode_text = "切换到熊市"
@@ -181,7 +185,8 @@ class Backtester:
                     self.market_mode = 'bear'
                     self.bull_signal_count = 0
                     self.bear_signal_count = self.MARKET_MODE_CONFIRM_DAYS
-                logger.info(f"{date_str} 牛市模式风险控制 - 回撤 {drawdown:.2f}%, 价格/MA200: {price_to_ma200_ratio:.3f}, {mode_text}")
+                if mode_text:
+                    logger.info(f"{date_str} 牛市模式风险控制 - 回撤 {drawdown:.2f}%, 价格/MA200: {price_to_ma200_ratio:.3f}, {mode_text}")
                 self.equity_exposure = new_exposure
         
         return self.market_mode

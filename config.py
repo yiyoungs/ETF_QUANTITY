@@ -92,6 +92,10 @@ class StrategyConfig:
     MIN_SCALE = 200000000
     MIN_LISTING_DAYS = 365
     CASH_ETF_CODE = '511010'
+    
+    # 市场模式切换配置
+    MARKET_MODE_CONFIRM_DAYS = 2  # 连续调仓日确认次数
+    MA200_WINDOW = 200  # MA200周期
 
 # ==================== 回测时间配置 ====================
 @dataclass

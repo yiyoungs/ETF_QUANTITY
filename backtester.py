@@ -16,7 +16,7 @@ class Backtester:
         self.lookback_days = self.params.get('lookback_days', StrategyConfig.LOOKBACK_DAYS)
         self.trailing_stop_pct = self.params.get('trailing_stop_pct', 0.08)
         
-        self.periods_weights = self.params.get('periods_weights', None)
+        self.periods_weights = self.params.get('periods_weights', [(20, 0.5), (60, 0.3), (120, 0.2)])
         
         self.portfolio_manager = PortfolioManager(params=self.params)
         self.trading_dates = self._get_trading_dates()
@@ -25,9 +25,19 @@ class Backtester:
         
         # 双动量策略：市场模式判断
         self.market_mode = 'bear'  # 'bull' or 'bear'，初始为熊市
-        self.bull_signal_count = 0  # 连续牛市信号计数
-        self.bear_signal_count = 0  # 连续熊市信号计数
-        self.MA200_WINDOW = 200
+        self.bull_signal_count = 0  # 连续牛市信号计数（调仓日）
+        self.bear_signal_count = 0  # 连续熊市信号计数（调仓日）
+        self.MA200_WINDOW = StrategyConfig.MA200_WINDOW
+        self.MARKET_MODE_CONFIRM_DAYS = StrategyConfig.MARKET_MODE_CONFIRM_DAYS
+        
+        # 记录每日市场信号（用于检查）
+        self.daily_market_signals = []
+        
+        # 风险控制：动态权益仓位比例
+        self.equity_exposure = 0.0  # 当前权益仓位比例，牛市模式下可动态调整
+        
+        # 风险控制：跟踪沪深300前期高点，用于回撤控制
+        self.sp500_high_water_mark = 0.0  # 沪深300ETF前期高点
     
     def _get_trading_dates(self):
         dates = set()
@@ -56,6 +66,9 @@ class Backtester:
     def _check_market_mode(self, date_str):
         """
         检查市场模式：基于沪深300 MA200判断（使用前复权QFQ数据）
+        - 每日检查沪深300指数 vs MA200
+        - 连续2个调仓日确认才切换模式（防震荡市频繁切换）
+        - 牛市模式下动态调整权益仓位：当从高点回撤过大时降仓
         :return: 当前市场模式 'bull' 或 'bear'
         """
         # 使用QFQ（前复权）数据计算MA200，避免除权导致的均线失真
@@ -77,24 +90,99 @@ class Backtester:
         close_price = latest_data['close']
         ma200_price = latest_data['ma200']
         
+        # 更新前期高点
+        if close_price > self.sp500_high_water_mark:
+            self.sp500_high_water_mark = close_price
+        
+        # 计算价格相对于MA200的偏离度
+        if ma200_price > 0:
+            deviation = (close_price - ma200_price) / ma200_price * 100
+        else:
+            deviation = 0.0
+        
+        # 计算从前期高点的回撤比例
+        if self.sp500_high_water_mark > 0:
+            drawdown = (self.sp500_high_water_mark - close_price) / self.sp500_high_water_mark * 100
+        else:
+            drawdown = 0.0
+        
         if close_price > ma200_price:
             current_signal = 'bull'
         else:
             current_signal = 'bear'
         
-        if current_signal == 'bull':
-            self.bull_signal_count += 1
-            self.bear_signal_count = 0
-        else:
-            self.bear_signal_count += 1
-            self.bull_signal_count = 0
+        # 记录每日信号
+        self.daily_market_signals.append({
+            'date': date_str,
+            'signal': current_signal,
+            'close': close_price,
+            'ma200': ma200_price,
+            'deviation': deviation,
+            'drawdown': drawdown,
+            'high_water_mark': self.sp500_high_water_mark
+        })
         
-        if self.bull_signal_count >= 1 and self.market_mode != 'bull':
-            logger.info(f"{date_str} 市场模式切换：熊市 -> 牛市 (连续1周信号确认)")
-            self.market_mode = 'bull'
-        elif self.bear_signal_count >= 1 and self.market_mode != 'bear':
-            logger.info(f"{date_str} 市场模式切换：牛市 -> 熊市 (连续1周信号确认)")
-            self.market_mode = 'bear'
+        # 只有调仓日才计数和调整
+        if self.is_rebalance_day(date_str):
+            logger.info(f"{date_str} 市场模式检查 - 当前信号: {current_signal}, 沪深300: {close_price:.2f}, MA200: {ma200_price:.2f}, 偏离度: {deviation:.2f}%, 回撤: {drawdown:.2f}%")
+            
+            if current_signal == 'bull':
+                self.bull_signal_count += 1
+                self.bear_signal_count = 0
+            else:
+                self.bear_signal_count += 1
+                self.bull_signal_count = 0
+            
+            # 连续N个调仓日确认才切换模式
+            if self.bull_signal_count >= self.MARKET_MODE_CONFIRM_DAYS and self.market_mode != 'bull':
+                logger.info(f"{date_str} 市场模式切换：熊市 -> 牛市 (连续{self.MARKET_MODE_CONFIRM_DAYS}个调仓日信号确认)")
+                self.market_mode = 'bull'
+                self.equity_exposure = 1.0
+                # 重置高点记录
+                self.sp500_high_water_mark = close_price
+            elif self.bear_signal_count >= self.MARKET_MODE_CONFIRM_DAYS and self.market_mode != 'bear':
+                logger.info(f"{date_str} 市场模式切换：牛市 -> 熊市 (连续{self.MARKET_MODE_CONFIRM_DAYS}个调仓日信号确认)")
+                self.market_mode = 'bear'
+                self.equity_exposure = 0.0
+        
+        # 牛市模式下：持续更新高点并检查回撤
+        if self.market_mode == 'bull':
+            # 持续更新沪深300高点
+            if close_price > self.sp500_high_water_mark:
+                self.sp500_high_water_mark = close_price
+                # 重新计算回撤（基于新高点）
+                drawdown = 0.0
+            
+            # 双重风险控制：回撤 + 价格与MA200的偏离度
+            # 逐步降仓策略
+            price_to_ma200_ratio = close_price / ma200_price if ma200_price > 0 else 1.0
+            
+            # 根据回撤程度逐步降低权益仓位
+            if drawdown > 12.0 or price_to_ma200_ratio < 1.01:
+                new_exposure = 0.0
+                mode_text = "切换到熊市"
+            elif drawdown > 10.0:
+                new_exposure = 0.25
+                mode_text = "降仓至25%"
+            elif drawdown > 8.0:
+                new_exposure = 0.5
+                mode_text = "降仓至50%"
+            elif drawdown > 6.0:
+                new_exposure = 0.75
+                mode_text = "降仓至75%"
+            elif price_to_ma200_ratio < 1.03:
+                new_exposure = 0.85
+                mode_text = "接近MA200，降仓至85%"
+            else:
+                new_exposure = 1.0
+            
+            if new_exposure != self.equity_exposure:
+                if new_exposure == 0.0:
+                    self.market_mode = 'bear'
+                    self.bull_signal_count = 0
+                    self.bear_signal_count = self.MARKET_MODE_CONFIRM_DAYS
+                logger.info(f"{date_str} 牛市模式风险控制 - 回撤 {drawdown:.2f}%, 价格/MA200: {price_to_ma200_ratio:.3f}, {mode_text}")
+                self.equity_exposure = new_exposure
         
         return self.market_mode
     
@@ -103,13 +191,13 @@ class Backtester:
         logger.info(f"初始资金: {StrategyConfig.INITIAL_CAPITAL:,}")
         logger.info(f"动量周期配置: {self.periods_weights}")
         logger.info(f"初始市场模式: {self.market_mode}")
+        logger.info(f"模式切换确认天数: {self.MARKET_MODE_CONFIRM_DAYS} 个调仓日")
         
         for date_str in self.trading_dates:
             date = pd.to_datetime(date_str)
             
-            # 只有在调仓日才检查市场模式
-            if self.is_rebalance_day(date_str):
-                self._check_market_mode(date_str)
+            # 每日检查市场模式（但只在调仓日才会触发模式切换）
+            self._check_market_mode(date_str)
             
             # 止损检查和执行（每日执行）
             stop_loss_result = self._daily_process(date_str)
@@ -124,7 +212,8 @@ class Backtester:
                     self.portfolio_manager.rebalance(
                         self.all_data, self.etf_pool, date_str,
                         periods_weights=self.periods_weights,
-                        market_mode=self.market_mode
+                        market_mode=self.market_mode,
+                        equity_exposure=self.equity_exposure
                     )
                     self.initial_rebalance_done = True
             
@@ -172,12 +261,13 @@ class Backtester:
         return {'triggered': stop_loss_triggered, 'list': stop_loss_list}
     
     def _weekly_rebalance(self, date_str, exclude=None):
-        logger.info(f"{date_str} 执行周度调仓，当前市场模式: {self.market_mode}")
+        logger.info(f"{date_str} 执行周度调仓，当前市场模式: {self.market_mode}, 权益仓位: {self.equity_exposure*100:.0f}%")
         self.portfolio_manager.rebalance(
             self.all_data, self.etf_pool, date_str, 
             exclude=exclude,
             periods_weights=self.periods_weights,
-            market_mode=self.market_mode
+            market_mode=self.market_mode,
+            equity_exposure=self.equity_exposure
         )
     
     def get_results_df(self):

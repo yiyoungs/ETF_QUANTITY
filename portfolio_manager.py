@@ -178,27 +178,37 @@ class PortfolioManager:
         
         return capped_weights
     
-    def rebalance(self, all_data, etf_pool, current_date, exclude=None, periods_weights=None, market_mode='bear'):
+    def rebalance(self, all_data, etf_pool, current_date, exclude=None, periods_weights=None, market_mode='bear', equity_exposure=1.0):
         """
         双动量策略调仓逻辑
         
-        牛市模式（bull）：100%满仓进攻，取Top5行业ETF，等权分配
-        熊市模式（bear）：100%空仓防守，全部买国债ETF
+        牛市模式（bull）：沪深300 > MA200，选Top5动量行业ETF等权持仓，根据equity_exposure调整权益仓位
+        熊市模式（bear）：沪深300 < MA200，100%持有511010，不选行业ETF
         
         :param exclude: 排除的标的集合（用于止损后调仓，避免刚卖又买回）
         :param periods_weights: 动量周期配置，如 [(20, 0.5), (60, 0.3), (120, 0.2)]
         :param market_mode: 市场模式 'bull' 或 'bear'
+        :param equity_exposure: 权益仓位比例（0.0-1.0），牛市模式下有效
         """
         qfq_data = all_data.get('qfq', all_data)
         hfq_data = all_data.get('hfq', all_data)
         
         if market_mode == 'bull':
             target_portfolio = self._get_bull_portfolio(qfq_data, etf_pool, current_date, periods_weights)
+            # 牛市模式下确保不包含国债ETF
+            target_portfolio = [code for code in target_portfolio if code != StrategyConfig.CASH_ETF_CODE]
+            
+            # 如果权益仓位小于100%，剩余资金买入国债ETF
+            if equity_exposure < 1.0 and StrategyConfig.CASH_ETF_CODE not in target_portfolio:
+                target_portfolio.append(StrategyConfig.CASH_ETF_CODE)
         else:
             target_portfolio = [StrategyConfig.CASH_ETF_CODE]
         
         if exclude:
             target_portfolio = [code for code in target_portfolio if code not in exclude]
+        
+        # 保存权益仓位比例供后续买入时使用
+        self.current_equity_exposure = equity_exposure
         
         current_holdings = set(self.get_current_holdings())
         target_holdings = set(target_portfolio)
@@ -239,21 +249,26 @@ class PortfolioManager:
         牛市模式：获取Top5行业ETF（不含国债ETF）
         取消时序MA60过滤，只要动量排名前5就买入
         """
-        from signal_engine import get_top_momentum_stocks
+        from signal_engine import generate_target_portfolio
         
         equity_pool = etf_pool[etf_pool['code'] != StrategyConfig.CASH_ETF_CODE]
         
-        top_stocks = get_top_momentum_stocks(
+        # 牛市模式下跳过时序动量过滤，直接选择截面动量最高的标的
+        top_stocks = generate_target_portfolio(
             qfq_data, equity_pool, current_date, 
-            top_n=5, periods_weights=periods_weights
+            periods_weights=periods_weights,
+            skip_ts_filter=True  # 牛市模式不使用MA60过滤
         )
+        
+        # 确保不包含国债ETF
+        top_stocks = [code for code in top_stocks if code != StrategyConfig.CASH_ETF_CODE]
         
         return top_stocks
     
     def _execute_buy(self, hfq_data, to_buy, current_date, market_mode):
         """
         执行买入操作
-        牛市模式：100%资金等权分配给Top5行业ETF
+        牛市模式：根据equity_exposure分配资金，权益部分等权分配给行业ETF，剩余买入国债ETF
         熊市模式：100%资金买入国债ETF
         """
         remaining_cash = self.cash
@@ -277,31 +292,73 @@ class PortfolioManager:
             logger.warning(f"{current_date} 没有可买入的标的")
             return
         
-        n_stocks = len(buy_info)
-        equal_weight = 1.0 / n_stocks
-        
         sorted_etfs = list(buy_info.keys())
-        logger.info(f"{current_date} [{market_mode}] 买入顺序: {sorted_etfs}")
         
-        for etf_code in sorted_etfs:
-            info = buy_info[etf_code]
-            price = info['price']
+        # 牛市模式下根据权益仓位比例分配资金
+        if market_mode == 'bull' and hasattr(self, 'current_equity_exposure'):
+            equity_exposure = self.current_equity_exposure
             
-            allocation = remaining_cash * equal_weight
-            max_shares = int(allocation / price / (1 + StrategyConfig.TRANSACTION_COST))
-            shares_to_buy = (max_shares // 100) * 100
+            # 分离股票ETF和国债ETF
+            equity_etfs = [code for code in sorted_etfs if code != StrategyConfig.CASH_ETF_CODE]
+            n_equity = len(equity_etfs)
             
-            if shares_to_buy <= 0:
-                continue
+            logger.info(f"{current_date} [{market_mode}] 买入顺序: {sorted_etfs}, 权益仓位: {equity_exposure*100:.0f}%")
             
-            total_spent = shares_to_buy * price * (1 + StrategyConfig.TRANSACTION_COST)
+            for etf_code in sorted_etfs:
+                info = buy_info[etf_code]
+                price = info['price']
+                
+                if etf_code == StrategyConfig.CASH_ETF_CODE:
+                    allocation = remaining_cash * (1 - equity_exposure)
+                else:
+                    if n_equity > 0:
+                        allocation = remaining_cash * equity_exposure / n_equity
+                    else:
+                        allocation = 0.0
+                
+                max_shares = int(allocation / price / (1 + StrategyConfig.TRANSACTION_COST))
+                shares_to_buy = (max_shares // 100) * 100
+                
+                if shares_to_buy <= 0:
+                    continue
+                
+                total_spent = shares_to_buy * price * (1 + StrategyConfig.TRANSACTION_COST)
+                
+                if total_spent <= remaining_cash:
+                    self.positions[etf_code] = shares_to_buy
+                    self.bought_dates[etf_code] = current_date
+                    self.highest_prices[etf_code] = price
+                    remaining_cash -= total_spent
+                    if etf_code == StrategyConfig.CASH_ETF_CODE:
+                        logger.info(f"{current_date} 买入 {etf_code}: {shares_to_buy} 份 @ {price:.2f}, 权重 {(1-equity_exposure):.1%}")
+                    else:
+                        logger.info(f"{current_date} 买入 {etf_code}: {shares_to_buy} 份 @ {price:.2f}, 权重 {equity_exposure/n_equity:.1%}")
+        else:
+            # 熊市模式或没有权益仓位设置，等权分配
+            n_stocks = len(buy_info)
+            equal_weight = 1.0 / n_stocks
             
-            if total_spent <= remaining_cash:
-                self.positions[etf_code] = shares_to_buy
-                self.bought_dates[etf_code] = current_date
-                self.highest_prices[etf_code] = price
-                remaining_cash -= total_spent
-                logger.info(f"{current_date} 买入 {etf_code}: {shares_to_buy} 份 @ {price:.2f}, 权重 {equal_weight:.1%}")
+            logger.info(f"{current_date} [{market_mode}] 买入顺序: {sorted_etfs}")
+            
+            for etf_code in sorted_etfs:
+                info = buy_info[etf_code]
+                price = info['price']
+                
+                allocation = remaining_cash * equal_weight
+                max_shares = int(allocation / price / (1 + StrategyConfig.TRANSACTION_COST))
+                shares_to_buy = (max_shares // 100) * 100
+                
+                if shares_to_buy <= 0:
+                    continue
+                
+                total_spent = shares_to_buy * price * (1 + StrategyConfig.TRANSACTION_COST)
+                
+                if total_spent <= remaining_cash:
+                    self.positions[etf_code] = shares_to_buy
+                    self.bought_dates[etf_code] = current_date
+                    self.highest_prices[etf_code] = price
+                    remaining_cash -= total_spent
+                    logger.info(f"{current_date} 买入 {etf_code}: {shares_to_buy} 份 @ {price:.2f}, 权重 {equal_weight:.1%}")
         
         self.cash = remaining_cash
 

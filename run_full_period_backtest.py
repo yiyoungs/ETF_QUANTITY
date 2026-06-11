@@ -259,7 +259,8 @@ def main():
     # 创建回测器
     params = {
         'lookback_days': 60,
-        'trailing_stop_pct': 0.08
+        'trailing_stop_pct': 0.20,  # 更宽松的止损
+        'periods_weights': [(20, 0.5), (60, 0.35), (120, 0.15)]  # 更重视短期动量
     }
     
     backtester = Backtester(

@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from dataclasses import dataclass, field
 
 # ==================== 路径配置 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +43,41 @@ ETF_PREFIX_MAP = {
     '517': 'SH',
 }
 
+# ==================== 高弹性行业/主题 ETF 池 ====================
+HIGH_ELASTIC_ETF_POOL = {
+    '科技主线': [
+        '512480',  # 半导体ETF
+        '159995',  # 芯片ETF
+        '512760',  # 半导体行业ETF
+        '515050',  # 5G ETF
+        '512000',  # 券商ETF
+    ],
+    '高端制造/新能源': [
+        '515030',  # 新能源车ETF
+        '159875',  # 光伏ETF
+        '512660',  # 军工ETF
+    ],
+    '消费/医药': [
+        '512690',  # 酒ETF
+        '159928',  # 消费ETF
+        '512010',  # 医药ETF
+        '159801',  # 恒生科技ETF
+    ],
+    '周期/红利': [
+        '512890',  # 红利ETF
+        '510880',  # 红利低波ETF
+        '168204',  # 煤炭LOF
+        '512400',  # 有色ETF
+    ]
+}
+
+def get_all_high_elastic_etfs():
+    """获取所有高弹性ETF代码列表"""
+    all_codes = []
+    for category, codes in HIGH_ELASTIC_ETF_POOL.items():
+        all_codes.extend(codes)
+    return all_codes
+
 # ==================== 策略参数配置 ====================
 class StrategyConfig:
     INITIAL_CAPITAL = 1000000
@@ -58,10 +94,11 @@ class StrategyConfig:
     CASH_ETF_CODE = '511010'
 
 # ==================== 回测时间配置 ====================
+@dataclass
 class BacktestConfig:
-    START_DATE = '2018-01-01'
-    END_DATE = datetime.now().strftime(DATE_FORMAT)
-    REBALANCE_DAY = 4
+    start_date: str = '2018-01-01'
+    end_date: str = field(default_factory=lambda: datetime.now().strftime(DATE_FORMAT))
+    rebalance_day: int = 4
 
 # ==================== 日志配置 ====================
 LOG_LEVEL = 'INFO'
@@ -72,3 +109,12 @@ class DataConfig:
     REQUEST_INTERVAL = 0.5
     MAX_RETRY = 3
     TIMEOUT = 30
+
+# ==================== 参数敏感性测试配置 ====================
+PARAM_GRID = {
+    'lookback_days': [40, 50, 60, 70, 80],
+    'trailing_stop_pct': [0.08, 0.10, 0.12, 0.15]
+}
+
+# 全局默认回测配置实例
+DEFAULT_BACKTEST_CONFIG = BacktestConfig()

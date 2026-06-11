@@ -7,14 +7,6 @@ from config import StrategyConfig
 import logging
 import os
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.join('logs', 'analyzer.log')),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 class Analyzer:
@@ -47,11 +39,37 @@ class Analyzer:
         avg_loss = df[df['daily_return'] < 0]['daily_return'].mean() * 100
         profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else np.nan
         
-        df['equity'] = df['nav'].cummax()
-        df['watermark'] = (df['nav'] >= df['equity'].shift(1)).cumsum()
-        recovery_days = df[df['watermark'] != df['watermark'].shift(1)].shape[0] - 1
+        # 回撤恢复天数：记录每次从回撤恢复到前高所需的天数
+        recovery_days_list = []
+        peak_nav = df['nav'].iloc[0]
+        peak_date = df['date'].iloc[0]
+        in_drawdown = False
+        drawdown_start_date = None
+
+        for i in range(1, len(df)):
+            current_nav = df['nav'].iloc[i]
+            current_date = df['date'].iloc[i]
+
+            if current_nav > peak_nav:
+                # 创新高
+                if in_drawdown:
+                    # 从回撤中恢复到前高，记录恢复天数
+                    recovery_days = (current_date - drawdown_start_date).days
+                    recovery_days_list.append(recovery_days)
+                    in_drawdown = False
+                peak_nav = current_nav
+                peak_date = current_date
+            elif not in_drawdown and current_nav < peak_nav:
+                # 从峰值开始回撤
+                in_drawdown = True
+                drawdown_start_date = peak_date
+
+        max_recovery_days = max(recovery_days_list) if recovery_days_list else 0
+        avg_recovery_days = sum(recovery_days_list) / len(recovery_days_list) if recovery_days_list else 0
         
-        self.metrics = {
+        self._calculate_exposure_metrics(df)
+        
+        self.metrics.update({
             'total_return': total_return,
             'annualized_return': annual_return / 100,
             'annualized_volatility': annual_std / 100,
@@ -59,12 +77,58 @@ class Analyzer:
             'max_drawdown': max_drawdown / 100,
             'win_rate': win_rate / 100,
             'profit_factor': profit_factor,
-            'recovery_days': recovery_days,
+            'max_recovery_days': max_recovery_days,
+            'avg_recovery_days': avg_recovery_days,
             'total_days': total_days,
             'years': years
-        }
+        })
         
         return self.metrics
+    
+    def _calculate_exposure_metrics(self, df):
+        """
+        计算持仓暴露度指标
+        - 风险资产仓位占比：持有非国债 ETF 的天数 / 总交易日天数
+        - 平均持仓数量：平均每天持有几只风险 ETF
+        - 最大连续空仓天数：连续全仓国债的最长天数
+        """
+        cash_etf = StrategyConfig.CASH_ETF_CODE
+        
+        def has_risk_assets(positions):
+            if not positions:
+                return False
+            for code in positions.keys():
+                if code != cash_etf and positions[code] > 0:
+                    return True
+            return False
+        
+        def count_risk_assets(positions):
+            count = 0
+            if positions:
+                for code, shares in positions.items():
+                    if code != cash_etf and shares > 0:
+                        count += 1
+            return count
+        
+        df['has_risk_assets'] = df['positions'].apply(has_risk_assets)
+        df['risk_asset_count'] = df['positions'].apply(count_risk_assets)
+        
+        risk_days = df['has_risk_assets'].sum()
+        risk_exposure_ratio = risk_days / len(df)
+        
+        avg_position_count = df['risk_asset_count'].mean()
+        
+        df['is_all_cash'] = ~df['has_risk_assets']
+        df['cash_streak'] = df['is_all_cash'].astype(int).groupby(
+            (df['is_all_cash'] != df['is_all_cash'].shift()).cumsum()
+        ).cumsum()
+        max_cash_streak = df['cash_streak'].max()
+        
+        self.metrics.update({
+            'risk_exposure_ratio': risk_exposure_ratio,
+            'avg_position_count': avg_position_count,
+            'max_cash_streak': int(max_cash_streak)
+        })
     
     def generate_report(self, output_dir='reports'):
         os.makedirs(output_dir, exist_ok=True)
@@ -100,6 +164,11 @@ class Analyzer:
             f.write(f"  回测年限: {self.metrics['years']:.2f} 年\n")
             f.write(f"  胜率: {self.metrics['win_rate'] * 100:.2f}%\n")
             f.write(f"  盈亏比: {self.metrics['profit_factor']:.2f}\n")
+            f.write("\n")
+            f.write("【持仓暴露度分析】\n")
+            f.write(f"  风险资产仓位占比: {self.metrics['risk_exposure_ratio'] * 100:.2f}%\n")
+            f.write(f"  平均持仓数量: {self.metrics['avg_position_count']:.1f} 只\n")
+            f.write(f"  最大连续空仓天数: {self.metrics['max_cash_streak']} 天\n")
         
         logger.info(f"绩效报告已保存至: {report_path}")
         
@@ -161,12 +230,16 @@ class Analyzer:
         print(f"初始资金: {StrategyConfig.INITIAL_CAPITAL:,} 元")
         print(f"\n【核心指标】")
         print(f"  总收益率: {self.metrics['total_return']:.2f}%")
-        print(f"  年化收益率: {self.metrics['annual_return']:.2f}%")
-        print(f"  年化波动率: {self.metrics['annual_std']:.2f}%")
+        print(f"  年化收益率: {self.metrics['annualized_return'] * 100:.2f}%")
+        print(f"  年化波动率: {self.metrics['annualized_volatility'] * 100:.2f}%")
         print(f"  夏普比率: {self.metrics['sharpe_ratio']:.2f}")
-        print(f"  最大回撤: {self.metrics['max_drawdown']:.2f}%")
-        print(f"  胜率: {self.metrics['win_rate']:.2f}%")
+        print(f"  最大回撤: {self.metrics['max_drawdown'] * 100:.2f}%")
+        print(f"  胜率: {self.metrics['win_rate'] * 100:.2f}%")
         print(f"  盈亏比: {self.metrics['profit_factor']:.2f}")
+        print(f"\n【持仓暴露度】")
+        print(f"  风险资产仓位占比: {self.metrics['risk_exposure_ratio'] * 100:.2f}%")
+        print(f"  平均持仓数量: {self.metrics['avg_position_count']:.1f} 只")
+        print(f"  最大连续空仓天数: {self.metrics['max_cash_streak']} 天")
 
 if __name__ == '__main__':
     logger.info("=== 绩效分析模块测试 ===")

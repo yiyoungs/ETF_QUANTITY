@@ -1,27 +1,33 @@
 import pandas as pd
 import numpy as np
-from config import StrategyConfig, BacktestConfig
+from config import StrategyConfig, BacktestConfig, DEFAULT_BACKTEST_CONFIG
 from portfolio_manager import PortfolioManager
 import logging
 import os
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.join('logs', 'backtester.log')),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 class Backtester:
-    def __init__(self, all_data, etf_pool):
+    def __init__(self, all_data, etf_pool, params=None, backtest_config=None):
         self.all_data = all_data
         self.etf_pool = etf_pool
-        self.portfolio_manager = PortfolioManager()
+        self.params = params or {}
+        self.backtest_config = backtest_config or DEFAULT_BACKTEST_CONFIG
+        self.lookback_days = self.params.get('lookback_days', StrategyConfig.LOOKBACK_DAYS)
+        self.trailing_stop_pct = self.params.get('trailing_stop_pct', 0.08)
+        
+        self.periods_weights = self.params.get('periods_weights', None)
+        
+        self.portfolio_manager = PortfolioManager(params=self.params)
         self.trading_dates = self._get_trading_dates()
         self.daily_results = []
+        self.initial_rebalance_done = False
+        
+        # 双动量策略：市场模式判断
+        self.market_mode = 'bear'  # 'bull' or 'bear'，初始为熊市
+        self.bull_signal_count = 0  # 连续牛市信号计数
+        self.bear_signal_count = 0  # 连续熊市信号计数
+        self.MA200_WINDOW = 200
     
     def _get_trading_dates(self):
         dates = set()
@@ -38,40 +44,100 @@ class Backtester:
         if not dates:
             return []
         
-        start_idx = dates.index(BacktestConfig.START_DATE) if BacktestConfig.START_DATE in dates else 0
-        end_idx = dates.index(BacktestConfig.END_DATE) + 1 if BacktestConfig.END_DATE in dates else len(dates)
+        start_idx = dates.index(self.backtest_config.start_date) if self.backtest_config.start_date in dates else 0
+        end_idx = dates.index(self.backtest_config.end_date) + 1 if self.backtest_config.end_date in dates else len(dates)
         
         return dates[start_idx:end_idx]
     
     def is_rebalance_day(self, date_str):
         date = pd.to_datetime(date_str)
-        return date.weekday() == BacktestConfig.REBALANCE_DAY
+        return date.weekday() == self.backtest_config.rebalance_day
+    
+    def _check_market_mode(self, date_str):
+        """
+        检查市场模式：基于沪深300 MA200判断（使用前复权QFQ数据）
+        :return: 当前市场模式 'bull' 或 'bear'
+        """
+        # 使用QFQ（前复权）数据计算MA200，避免除权导致的均线失真
+        qfq_data = self.all_data.get('qfq', self.all_data)
+        
+        if '510300' not in qfq_data:
+            logger.warning("无法获取沪深300ETF数据，使用当前市场模式")
+            return self.market_mode
+        
+        df = qfq_data['510300']
+        df = df[df['date'] <= pd.to_datetime(date_str)].copy()
+        
+        if len(df) < self.MA200_WINDOW:
+            return self.market_mode
+        
+        df.loc[:, 'ma200'] = df['close'].rolling(window=self.MA200_WINDOW).mean().shift(1)
+        latest_data = df.iloc[-1]
+        
+        close_price = latest_data['close']
+        ma200_price = latest_data['ma200']
+        
+        if close_price > ma200_price:
+            current_signal = 'bull'
+        else:
+            current_signal = 'bear'
+        
+        if current_signal == 'bull':
+            self.bull_signal_count += 1
+            self.bear_signal_count = 0
+        else:
+            self.bear_signal_count += 1
+            self.bull_signal_count = 0
+        
+        if self.bull_signal_count >= 1 and self.market_mode != 'bull':
+            logger.info(f"{date_str} 市场模式切换：熊市 -> 牛市 (连续1周信号确认)")
+            self.market_mode = 'bull'
+        elif self.bear_signal_count >= 1 and self.market_mode != 'bear':
+            logger.info(f"{date_str} 市场模式切换：牛市 -> 熊市 (连续1周信号确认)")
+            self.market_mode = 'bear'
+        
+        return self.market_mode
     
     def run(self):
         logger.info(f"开始回测: {self.trading_dates[0]} ~ {self.trading_dates[-1]}")
         logger.info(f"初始资金: {StrategyConfig.INITIAL_CAPITAL:,}")
-        
-        first_date = self.trading_dates[0]
-        logger.info(f"{first_date} 执行初始调仓")
-        self.portfolio_manager.rebalance(self.all_data, self.etf_pool, first_date)
+        logger.info(f"动量周期配置: {self.periods_weights}")
+        logger.info(f"初始市场模式: {self.market_mode}")
         
         for date_str in self.trading_dates:
             date = pd.to_datetime(date_str)
             
-            self._daily_process(date_str)
-            
+            # 只有在调仓日才检查市场模式
             if self.is_rebalance_day(date_str):
-                self._weekly_rebalance(date_str)
+                self._check_market_mode(date_str)
+            
+            # 止损检查和执行（每日执行）
+            stop_loss_result = self._daily_process(date_str)
+            stop_loss_list = stop_loss_result['list']
+            
+            # 只有在调仓日才执行调仓（每周一次）
+            if self.is_rebalance_day(date_str):
+                if self.initial_rebalance_done:
+                    self._weekly_rebalance(date_str, exclude=set(stop_loss_list))
+                else:
+                    logger.info(f"{date_str} 执行初始调仓，当前市场模式: {self.market_mode}")
+                    self.portfolio_manager.rebalance(
+                        self.all_data, self.etf_pool, date_str,
+                        periods_weights=self.periods_weights,
+                        market_mode=self.market_mode
+                    )
+                    self.initial_rebalance_done = True
             
             total_value = self.portfolio_manager.get_total_value(self.all_data, date_str)
-            self.portfolio_manager.record_daily_status(date_str, total_value)
+            self.portfolio_manager.record_daily_status(date_str, total_value, self.all_data)
             
             daily_record = {
                 'date': date_str,
                 'total_value': total_value,
                 'cash': self.portfolio_manager.cash,
                 'positions': dict(self.portfolio_manager.positions),
-                'is_rebalance': self.is_rebalance_day(date_str)
+                'is_rebalance': self.is_rebalance_day(date_str),
+                'market_mode': self.market_mode
             }
             self.daily_results.append(daily_record)
             
@@ -82,32 +148,37 @@ class Backtester:
         return self.get_results_df()
     
     def _daily_process(self, date_str):
+        """每日处理：分红检查、止损检查和执行
+        返回：字典 {'triggered': bool, 'list': list}
+        """
         self.portfolio_manager.check_dividends(self.all_data, date_str)
         
-        stop_loss_list = self.portfolio_manager.check_stop_loss(self.all_data, date_str)
+        logger.debug(f"{date_str} 止损检查: 使用 trailing_stop_pct={self.trailing_stop_pct:.2%}")
+        stop_loss_list = self.portfolio_manager.check_stop_loss(
+            self.all_data, date_str, self.trailing_stop_pct
+        )
+        logger.debug(f"{date_str} 止损列表: {stop_loss_list}")
+        
+        self.portfolio_manager.update_highest_price(self.all_data, date_str)
+        
+        stop_loss_triggered = len(stop_loss_list) > 0
         
         for etf_code in stop_loss_list:
             self.portfolio_manager.execute_stop_loss(self.all_data, etf_code, date_str)
-            
-            if StrategyConfig.CASH_ETF_CODE not in self.portfolio_manager.positions:
-                hfq_data = self.all_data.get('hfq', self.all_data)
-                df = hfq_data.get(StrategyConfig.CASH_ETF_CODE)
-                if df is not None and not df.empty:
-                    price = df[df['date'] <= pd.to_datetime(date_str)]['close'].iloc[-1]
-                    cost = self.portfolio_manager.cash * StrategyConfig.TRANSACTION_COST
-                    available_cash = self.portfolio_manager.cash - cost
-                    shares = int(available_cash / price / 100) * 100
-                    
-                    if shares > 0:
-                        self.portfolio_manager.positions[StrategyConfig.CASH_ETF_CODE] = shares
-                        self.portfolio_manager.bought_dates[StrategyConfig.CASH_ETF_CODE] = date_str
-                        self.portfolio_manager.cash -= shares * price + cost
-                        
-                        logger.info(f"{date_str} 止损后换入 {StrategyConfig.CASH_ETF_CODE}: {shares} 份 @ {price:.2f}")
+        
+        # 优化3：取消止损后自动换入国债ETF，改为在周度调仓时统一处理
+        # 这样可以让止损释放的现金在调仓时更高效地分配
+        
+        return {'triggered': stop_loss_triggered, 'list': stop_loss_list}
     
-    def _weekly_rebalance(self, date_str):
-        logger.info(f"{date_str} 执行周度调仓")
-        self.portfolio_manager.rebalance(self.all_data, self.etf_pool, date_str)
+    def _weekly_rebalance(self, date_str, exclude=None):
+        logger.info(f"{date_str} 执行周度调仓，当前市场模式: {self.market_mode}")
+        self.portfolio_manager.rebalance(
+            self.all_data, self.etf_pool, date_str, 
+            exclude=exclude,
+            periods_weights=self.periods_weights,
+            market_mode=self.market_mode
+        )
     
     def get_results_df(self):
         df = pd.DataFrame(self.daily_results)

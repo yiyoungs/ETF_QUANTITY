@@ -128,6 +128,15 @@ if __name__ == '__main__':
     print(f"  胜率: {win_rate:.2f}%")
     print(f"  盈亏比: {profit_factor:.2f}")
     
+    print("\n【持仓暴露度分析】")
+    risk_exposure_ratio = analyzer.metrics.get('risk_exposure_ratio', 0) * 100
+    avg_position_count = analyzer.metrics.get('avg_position_count', 0)
+    max_cash_streak = analyzer.metrics.get('max_cash_streak', 0)
+    
+    print(f"  风险资产仓位占比: {risk_exposure_ratio:.2f}%")
+    print(f"  平均持仓数量: {avg_position_count:.1f} 只")
+    print(f"  最大连续空仓天数: {max_cash_streak} 天")
+    
     print("\n" + "=" * 70)
     print("                    测试完成")
     print("=" * 70)

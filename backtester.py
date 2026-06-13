@@ -40,14 +40,27 @@ class Backtester:
             for etf_code, df in self.all_data.items():
                 if not df.empty:
                     dates.update(df['date'].dt.strftime('%Y-%m-%d').tolist())
-        
+
         dates = sorted(list(dates))
         if not dates:
             return []
-        
-        start_idx = dates.index(self.backtest_config.start_date) if self.backtest_config.start_date in dates else 0
-        end_idx = dates.index(self.backtest_config.end_date) + 1 if self.backtest_config.end_date in dates else len(dates)
-        
+
+        start_str = self.backtest_config.start_date
+        end_str = self.backtest_config.end_date
+
+        # 找到第一个 >= start_str 的交易日（如果 start_str 不是交易日）
+        start_idx = 0
+        for i, d in enumerate(dates):
+            if d >= start_str:
+                start_idx = i
+                break
+        # 找到最后一个 <= end_str 的交易日
+        end_idx = len(dates)
+        for i in range(len(dates) - 1, -1, -1):
+            if dates[i] <= end_str:
+                end_idx = i + 1
+                break
+
         return dates[start_idx:end_idx]
     
     def is_rebalance_day(self, date_str):

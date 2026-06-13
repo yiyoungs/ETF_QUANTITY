@@ -1,13 +1,17 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
 from config import StrategyConfig
 import logging
 import os
 
-logger = logging.getLogger(__name__)
+def _get_plt():
+    """lazy import matplotlib (防止未安装 matplotlib 时失败)"""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    return plt
 
 class Analyzer:
     def __init__(self, results_df):
@@ -178,6 +182,7 @@ class Analyzer:
         return self.metrics
     
     def plot_nav(self, output_dir):
+        plt = _get_plt()
         df = self.results_df.copy()
         
         plt.figure(figsize=(12, 6))

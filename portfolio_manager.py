@@ -178,61 +178,78 @@ class PortfolioManager:
         
         return capped_weights
     
-    def rebalance(self, all_data, etf_pool, current_date, exclude=None, periods_weights=None, market_mode='bear'):
+    def rebalance(self, all_data, etf_pool, current_date, exclude=None, periods_weights=None, market_mode='bear', equity_ratio=1.0):
         """
-        双动量策略调仓逻辑
-        
-        牛市模式（bull）：100%满仓进攻，取Top5行业ETF，等权分配
-        熊市模式（bear）：100%空仓防守，全部买国债ETF
-        
+        双动量策略调仓逻辑（v2 改进版）
+
+        - 引入 equity_ratio [0,1]：平滑控制风险资产仓位，介于空仓与满仓之间
+        - 使用波动率加权（替代等权），降低高波动标的对组合回撤的贡献
+        - 在执行买入时使用"总资金一次性分配"，避免因分批扣减导致的递减分配
+
         :param exclude: 排除的标的集合（用于止损后调仓，避免刚卖又买回）
-        :param periods_weights: 动量周期配置，如 [(20, 0.5), (60, 0.3), (120, 0.2)]
+        :param periods_weights: 动量周期配置
         :param market_mode: 市场模式 'bull' 或 'bear'
+        :param equity_ratio: 风险资产仓位比例 (0.0 ~ 1.0)，用于平滑调节
         """
         qfq_data = all_data.get('qfq', all_data)
         hfq_data = all_data.get('hfq', all_data)
-        
+
+        # --- 决定目标组合 ---
         if market_mode == 'bull':
             target_portfolio = self._get_bull_portfolio(qfq_data, etf_pool, current_date, periods_weights)
         else:
-            target_portfolio = [StrategyConfig.CASH_ETF_CODE]
-        
+            target_portfolio = []
+
         if exclude:
             target_portfolio = [code for code in target_portfolio if code not in exclude]
-        
+
+        # 始终保留国债 ETF 作为安全垫
+        if StrategyConfig.CASH_ETF_CODE not in target_portfolio:
+            target_portfolio.append(StrategyConfig.CASH_ETF_CODE)
+
         current_holdings = set(self.get_current_holdings())
         target_holdings = set(target_portfolio)
-        
+
         to_sell = current_holdings - target_holdings
-        to_buy = target_holdings - current_holdings
-        
-        logger.info(f"{current_date} [{market_mode}] 调仓计划 - 卖出: {list(to_sell)}, 买入: {list(to_buy)}")
-        
+
+        logger.info(
+            f"{current_date} [{market_mode}] 调仓计划 - "
+            f"equity_ratio={equity_ratio:.2f}, 卖出: {list(to_sell)}, 候选买入: {target_portfolio}"
+        )
+
+        # --- 卖出不在目标池的持仓 ---
+        proceeds_cash = 0.0
         for etf_code in to_sell:
-            if etf_code in self.positions:
-                if not self.can_sell(etf_code, current_date):
-                    logger.info(f"{current_date} 无法卖出 {etf_code}: T+1 限制")
-                    continue
-                
-                df = hfq_data.get(etf_code)
-                if df is None or df.empty:
-                    logger.warning(f"{current_date} 卖出失败: {etf_code} 不在 hfq 数据中")
-                    continue
-                
-                price = df[df['date'] <= pd.to_datetime(current_date)]['close'].iloc[-1]
-                shares = self.positions[etf_code]
-                
-                amount = shares * price
-                cost = amount * StrategyConfig.TRANSACTION_COST
-                
-                self.cash += amount - cost
-                del self.positions[etf_code]
+            if etf_code not in self.positions:
+                continue
+            if not self.can_sell(etf_code, current_date):
+                logger.info(f"{current_date} 无法卖出 {etf_code}: T+1 限制")
+                continue
+
+            df = hfq_data.get(etf_code)
+            if df is None or df.empty:
+                logger.warning(f"{current_date} 卖出失败: {etf_code} 不在 hfq 数据中")
+                continue
+
+            price = df[df['date'] <= pd.to_datetime(current_date)]['close'].iloc[-1]
+            shares = self.positions[etf_code]
+
+            amount = shares * price
+            cost = amount * StrategyConfig.TRANSACTION_COST
+
+            self.cash += (amount - cost)
+            proceeds_cash += (amount - cost)
+            del self.positions[etf_code]
+            if etf_code in self.bought_dates:
                 del self.bought_dates[etf_code]
-                
-                logger.info(f"{current_date} 清仓卖出 {etf_code}: {shares} 份 @ {price:.2f}, 获得 {amount - cost:.2f}")
-        
-        if to_buy:
-            self._execute_buy(hfq_data, to_buy, current_date, market_mode)
+
+            logger.info(f"{current_date} 清仓卖出 {etf_code}: {shares} 份 @ {price:.2f}, 获得 {amount - cost:.2f}")
+
+        # --- 执行买入（使用波动率加权 + equity_ratio 控制） ---
+        self._execute_buy(
+            all_data, target_portfolio, current_date, market_mode,
+            equity_ratio=equity_ratio
+        )
     
     def _get_bull_portfolio(self, qfq_data, etf_pool, current_date, periods_weights):
         """
@@ -250,60 +267,153 @@ class PortfolioManager:
         
         return top_stocks
     
-    def _execute_buy(self, hfq_data, to_buy, current_date, market_mode):
+    def _execute_buy(self, all_data, target_portfolio, current_date, market_mode, equity_ratio=1.0):
         """
-        执行买入操作
-        牛市模式：100%资金等权分配给Top5行业ETF
-        熊市模式：100%资金买入国债ETF
+        执行买入操作（v2 改进版）
+
+        关键改进：
+        1. 总资金在调仓前一次性决定（避免分批扣减导致的递减分配 bug）
+        2. 风险资产使用反向波动率加权（替代等权），降低高波动标的权重
+        3. 通过 equity_ratio 控制风险资产总仓位，平滑市场切换的回撤
+        4. 保留单标的权重上限（默认 25%），避免集中风险
+        5. 使用 T-1 收盘价作为执行价格，避免 lookahead bias
+
+        :param all_data: 完整的 ETF 数据字典（包含 hfq/qfq/dividend）
+        :param target_portfolio: 目标持仓列表（包含国债 ETF）
+        :param equity_ratio: 风险资产仓位比例 [0, 1]
         """
-        remaining_cash = self.cash
-        
-        buy_info = {}
-        for etf_code in to_buy:
+        hfq_data = all_data.get('hfq', all_data)
+        cash_etf = StrategyConfig.CASH_ETF_CODE
+
+        # 划分风险资产 vs 现金安全标的
+        risk_etfs = [code for code in target_portfolio if code != cash_etf]
+
+        # 预先获取所有标的价格 / 停牌检测
+        price_info = {}
+        for etf_code in target_portfolio:
             df = hfq_data.get(etf_code)
             if df is None or df.empty:
                 logger.warning(f"{current_date} 买入失败: {etf_code} 不在 hfq 数据中")
                 continue
-            
-            date_df = df[df['date'] == pd.to_datetime(current_date)]
-            if not date_df.empty and date_df.iloc[0].get('suspended', False):
+
+            # 停牌检测（若最近一天成交量为 0 则认为停牌）
+            date_df = df[df['date'] <= pd.to_datetime(current_date)]
+            if len(date_df) < 2:
+                continue
+            last_row = date_df.iloc[-1]
+            if 'volume' in last_row and pd.notna(last_row['volume']) and last_row['volume'] == 0:
                 logger.info(f"{current_date} 跳过停牌标的: {etf_code}")
                 continue
-            
-            price = df[df['date'] <= pd.to_datetime(current_date)]['close'].iloc[-1]
-            buy_info[etf_code] = {'price': price}
-        
-        if not buy_info:
+
+            # 使用 T-1 close（避免使用当日未实现收盘）
+            price = float(date_df['close'].iloc[-2])
+            if pd.isna(price) or price <= 0:
+                continue
+
+            price_info[etf_code] = {'price': price}
+
+        if not price_info:
             logger.warning(f"{current_date} 没有可买入的标的")
             return
-        
-        n_stocks = len(buy_info)
-        equal_weight = 1.0 / n_stocks
-        
-        sorted_etfs = list(buy_info.keys())
-        logger.info(f"{current_date} [{market_mode}] 买入顺序: {sorted_etfs}")
-        
-        for etf_code in sorted_etfs:
-            info = buy_info[etf_code]
-            price = info['price']
-            
-            allocation = remaining_cash * equal_weight
+
+        # --- 权重分配 ---
+        # 风险资产：根据可用资金 × equity_ratio 分配；使用反向波动率加权
+        # 国债资产：剩余资金 × (1 - equity_ratio) + 风险资产买不进后剩下的资金
+        total_cash = float(self.cash)
+        if total_cash <= 0:
+            logger.info(f"{current_date} 无可用现金用于买入")
+            return
+
+        # 约束 equity_ratio 范围
+        equity_ratio = max(0.0, min(1.0, float(equity_ratio)))
+
+        # 仅在 bull 模式且 equity_ratio > 0 时买入风险资产
+        eligible_risk_etfs = []
+        if market_mode == 'bull' and equity_ratio > 0 and risk_etfs:
+            eligible_risk_etfs = [code for code in risk_etfs if code in price_info]
+
+        risk_weights = {}
+        if eligible_risk_etfs:
+            # 对风险资产计算波动率权重（用完整 all_data，支持 hfq/qfq 访问）
+            risk_weights = self._calculate_volatility_weights(
+                all_data=all_data,
+                target_portfolio=eligible_risk_etfs,
+                current_date=current_date,
+                max_weight=0.25
+            )
+            w_sum = sum(risk_weights.values())
+            if w_sum > 0:
+                risk_weights = {k: v / w_sum for k, v in risk_weights.items()}
+            else:
+                risk_weights = {k: 1.0 / len(eligible_risk_etfs) for k in eligible_risk_etfs}
+
+        # 分配总资金
+        risk_cash_total = total_cash * equity_ratio
+        cash_etf_cash_total = total_cash * (1.0 - equity_ratio)
+
+        logger.info(
+            f"{current_date} 资金分配 - 总现金: {total_cash:.2f}, "
+            f"风险资产资金: {risk_cash_total:.2f} (equity_ratio={equity_ratio:.2f}), "
+            f"国债资金: {cash_etf_cash_total:.2f}"
+        )
+
+        # --- 风险资产买入（固定预算 × 波动率权重，不随前次买入递减） ---
+        total_risk_spent = 0.0
+        for etf_code in eligible_risk_etfs:
+            if etf_code not in risk_weights or risk_weights[etf_code] <= 0:
+                continue
+            if etf_code not in price_info:
+                continue
+
+            price = price_info[etf_code]['price']
+            allocation = risk_cash_total * risk_weights[etf_code]
             max_shares = int(allocation / price / (1 + StrategyConfig.TRANSACTION_COST))
             shares_to_buy = (max_shares // 100) * 100
-            
+
             if shares_to_buy <= 0:
                 continue
-            
+
             total_spent = shares_to_buy * price * (1 + StrategyConfig.TRANSACTION_COST)
-            
-            if total_spent <= remaining_cash:
-                self.positions[etf_code] = shares_to_buy
-                self.bought_dates[etf_code] = current_date
-                self.highest_prices[etf_code] = price
-                remaining_cash -= total_spent
-                logger.info(f"{current_date} 买入 {etf_code}: {shares_to_buy} 份 @ {price:.2f}, 权重 {equal_weight:.1%}")
-        
-        self.cash = remaining_cash
+            if total_spent > self.cash:
+                continue
+
+            self.positions[etf_code] = shares_to_buy
+            self.bought_dates[etf_code] = current_date
+            self.highest_prices[etf_code] = price
+            self.cash -= total_spent
+            total_risk_spent += total_spent
+            logger.info(
+                f"{current_date} 买入 {etf_code}: {shares_to_buy} 份 @ {price:.4f}, "
+                f"权重 {risk_weights[etf_code]:.2%}, 花费 {total_spent:.2f}"
+            )
+
+        # --- 最后买入国债（用配置的国债资金 + 风险资产未用完部分） ---
+        if cash_etf in price_info:
+            price = price_info[cash_etf]['price']
+            risk_unused = max(0.0, risk_cash_total - total_risk_spent)
+            # 取"配置预算 + 风险资产未用完部分"和"当前现金的99%"中的较小值
+            available_for_cash_etf = min(
+                cash_etf_cash_total + risk_unused,
+                self.cash * 0.99
+            )
+
+            if available_for_cash_etf > price * 100:
+                max_shares = int(available_for_cash_etf / price / (1 + StrategyConfig.TRANSACTION_COST))
+                shares_to_buy = (max_shares // 100) * 100
+
+                if shares_to_buy > 0:
+                    total_spent = shares_to_buy * price * (1 + StrategyConfig.TRANSACTION_COST)
+                    self.positions[cash_etf] = self.positions.get(cash_etf, 0) + shares_to_buy
+                    self.bought_dates[cash_etf] = current_date
+                    if cash_etf not in self.highest_prices:
+                        self.highest_prices[cash_etf] = price
+                    else:
+                        self.highest_prices[cash_etf] = max(self.highest_prices[cash_etf], price)
+                    self.cash -= total_spent
+                    logger.info(
+                        f"{current_date} 买入国债 {cash_etf}: {shares_to_buy} 份 @ {price:.4f}, "
+                        f"花费 {total_spent:.2f}"
+                    )
 
     def get_total_value(self, all_data, current_date):
         total = self.cash

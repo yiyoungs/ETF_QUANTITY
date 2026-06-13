@@ -6,9 +6,6 @@ from datetime import datetime
 import itertools
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
 
 from config import LOG_DIR, BacktestConfig, DEFAULT_BACKTEST_CONFIG, PARAM_GRID
 from data_fetcher import get_etf_pool, fetch_all_etf_data, load_cached_data

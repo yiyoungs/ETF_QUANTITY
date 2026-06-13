@@ -59,102 +59,125 @@ def filter_liquidity(all_data, etf_pool, target_date):
 def calc_multi_period_momentum(all_data, qualified_codes, target_date, periods_weights=None):
     """
     计算多周期动量融合评分（基于 T-1 日数据）
-    
+
     支持参数化周期配置：
     - 默认：20(0.5)+60(0.3)+120(0.2)
     - 方案B：10(0.4)+20(0.3)+60(0.3)
-    
+
     momentum_score = Σ(weight_i × rank(period_i收益率))
-    
-    :param all_data: 所有 ETF 的历史数据字典
-    :param qualified_codes: 符合流动性要求的 ETF 代码列表
-    :param target_date: 目标日期
-    :param periods_weights: 周期和权重列表，如 [(20, 0.5), (60, 0.3), (120, 0.2)]
-    :return: 按动量评分排序的 DataFrame，包含 code, momentum_score, 各周期收益
+
+    [Bug修复 v2]
+    - 修正 end_idx / start_idx 边界错误：当数据不足 max_period 时安全跳过
+    - 使用 T-1 收盘收益率 (close[-2]/close[end_idx-period] - 1)，避免使用当日未实现收盘价
+    - 对 NaN / 0 分母情况做保护
     """
     if periods_weights is None:
         periods_weights = [(20, 0.5), (60, 0.3), (120, 0.2)]
-    
+
     momentum_results = []
     target_dt = pd.to_datetime(target_date)
     max_period = max(p[0] for p in periods_weights)
-    
+
     for etf_code in qualified_codes:
         if etf_code not in all_data:
             continue
-        
+
         df = all_data[etf_code].copy()
         df = df[df['date'] <= target_dt].copy()
         df.reset_index(drop=True, inplace=True)
-        
-        if len(df) < max_period + 1:
+
+        # 需要至少 max_period + 2 天数据：确保 T-1 与 起点都为有效数据
+        if len(df) < max_period + 2:
             continue
-        
-        end_idx = len(df) - 1
+
+        # 使用 T-1 close（倒数第二行），避免使用当日未实现收盘价
+        end_idx = len(df) - 2
+        end_close = float(df['close'].iloc[end_idx])
+
+        if pd.isna(end_close) or end_close <= 0:
+            continue
+
         record = {'code': etf_code}
-        
+
+        all_valid = True
         for period, _ in periods_weights:
-            start_idx = max(0, end_idx - period)
-            ret = (df['close'].iloc[end_idx] - df['close'].iloc[start_idx]) / df['close'].iloc[start_idx]
+            start_idx = end_idx - period
+            if start_idx < 0:
+                all_valid = False
+                break
+            start_close = float(df['close'].iloc[start_idx])
+            if pd.isna(start_close) or start_close <= 0:
+                all_valid = False
+                break
+            ret = (end_close - start_close) / start_close
             record[f'mom_{period}'] = ret
-        
+
+        if not all_valid:
+            continue
+
         momentum_results.append(record)
-    
+
     if not momentum_results:
         return pd.DataFrame()
-    
+
     result_df = pd.DataFrame(momentum_results)
-    
-    # 使用rank计算加权动量评分
+
+    # 使用 rank 计算加权动量评分
     total_weight = sum(w for _, w in periods_weights)
+    if total_weight <= 0:
+        return pd.DataFrame()
+
     result_df['momentum_score'] = 0.0
-    
+
     for period, weight in periods_weights:
+        if f'mom_{period}' not in result_df.columns:
+            continue
         result_df[f'rank_{period}'] = result_df[f'mom_{period}'].rank(pct=True)
         result_df['momentum_score'] += (weight / total_weight) * result_df[f'rank_{period}']
-    
+
     result_df = result_df.sort_values('momentum_score', ascending=False).reset_index(drop=True)
-    
+
     return result_df
 
 
 def calculate_market_trend_strength(all_data, qualified_codes, target_date, ma_period=60):
     """
     方案A：计算市场趋势强度
-    
+
     计算每个标的(Price-MA60)/MA60的偏离度，取最大值作为市场趋势强度指标
-    
-    :param all_data: 所有ETF数据
-    :param qualified_codes: 符合流动性要求的ETF代码列表
-    :param target_date: 目标日期
-    :param ma_period: MA周期，默认60
-    :return: 趋势强度指标（最大偏离度%）
+
+    [Bug修复 v2]
+    - 使用 T-1 close 与 T-1 MA 比较，消除 lookahead bias
     """
     hfq_data = all_data.get('hfq', all_data)
     deviations = []
-    
+
     for etf_code in qualified_codes:
         if etf_code == StrategyConfig.CASH_ETF_CODE:
             continue
-        
+
         df = hfq_data.get(etf_code)
         if df is None or df.empty:
             continue
-        
-        df_filtered = df[df['date'] <= pd.to_datetime(target_date)]
-        if len(df_filtered) < ma_period + 1:
+
+        df_filtered = df[df['date'] <= pd.to_datetime(target_date)].copy()
+        # 需要 ma_period + 2 天，避免使用当日未实现收盘价
+        if len(df_filtered) < ma_period + 2:
             continue
-        
-        df_filtered['ma60'] = df_filtered['close'].rolling(window=ma_period).mean().shift(1)
-        latest = df_filtered.iloc[-1]
-        
-        if not pd.isna(latest['ma60']) and latest['ma60'] > 0:
-            deviation = (latest['close'] - latest['ma60']) / latest['ma60'] * 100
+
+        df_filtered['ma60'] = df_filtered['close'].rolling(window=ma_period).mean()
+        # 取 T-1 行
+        latest = df_filtered.iloc[-2]
+
+        ma_val = float(latest['ma60'])
+        close_val = float(latest['close'])
+        if (not pd.isna(close_val)) and (not pd.isna(ma_val)) and ma_val > 0:
+            deviation = (close_val - ma_val) / ma_val * 100
             deviations.append(deviation)
-    
+
     if not deviations:
         return 0.0
-    
+
     return max(deviations)
 
 
@@ -173,11 +196,9 @@ def calc_cross_section_momentum(all_data, qualified_codes, target_date, lookback
 def calc_time_series_momentum(all_data, etf_code, target_date, lookback_days=60):
     """
     计算时序动量（基于 T-1 日数据，使用不复权数据避免前复权跳空）
-    :param all_data: 所有 ETF 的历史数据字典
-    :param etf_code: ETF 代码
-    :param target_date: 目标日期
-    :param lookback_days: 均线周期（默认60天，可动态配置）
-    :return: 包含 MA 和 signal 的字典
+
+    [Bug修复 v2]
+    - 使用 T-1 close 与 T-1 MA 比较，消除 lookahead bias
     """
     if 'hfq' in all_data and etf_code in all_data['hfq']:
         df = all_data['hfq'][etf_code].copy()
@@ -185,22 +206,25 @@ def calc_time_series_momentum(all_data, etf_code, target_date, lookback_days=60)
         df = all_data[etf_code].copy()
     else:
         return {'code': etf_code, 'ma': np.nan, 'signal': False}
-    
+
     df = df[df['date'] <= pd.to_datetime(target_date)]
-    
-    if len(df) < lookback_days + 1:
+
+    # 需要至少 lookback_days + 2 天数据，确保 T-1 有有效 MA
+    if len(df) < lookback_days + 2:
         return {'code': etf_code, 'ma': np.nan, 'signal': False}
-    
+
     ma_col = f'ma{lookback_days}'
-    df[ma_col] = df['close'].rolling(window=lookback_days).mean().shift(1)
-    
-    latest_data = df.iloc[-1]
-    
-    price_above_ma = latest_data['close'] > latest_data[ma_col]
-    
+    df[ma_col] = df['close'].rolling(window=lookback_days).mean()
+    # 取 T-1 行（避免使用当日未实现收盘价）
+    latest_data = df.iloc[-2]
+
+    ma_val = float(latest_data[ma_col])
+    close_val = float(latest_data['close'])
+    price_above_ma = (not pd.isna(close_val)) and (not pd.isna(ma_val)) and (close_val > ma_val)
+
     return {
         'code': etf_code,
-        'ma': latest_data[ma_col],
+        'ma': ma_val,
         'signal': price_above_ma
     }
 

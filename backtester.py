@@ -22,12 +22,13 @@ class Backtester:
         self.trading_dates = self._get_trading_dates()
         self.daily_results = []
         self.initial_rebalance_done = False
-        
+
         # 双动量策略：市场模式判断
         self.market_mode = 'bear'  # 'bull' or 'bear'，初始为熊市
         self.bull_signal_count = 0  # 连续牛市信号计数
         self.bear_signal_count = 0  # 连续熊市信号计数
         self.MA200_WINDOW = 200
+        self.equity_ratio = 0.0  # 风险资产仓位比例 (0.0 ~ 1.0)，用于平滑仓位
     
     def _get_trading_dates(self):
         dates = set()
@@ -56,46 +57,90 @@ class Backtester:
     def _check_market_mode(self, date_str):
         """
         检查市场模式：基于沪深300 MA200判断（使用前复权QFQ数据）
-        :return: 当前市场模式 'bull' 或 'bear'
+
+        [Bug修复 v2]
+        - 消除 lookahead bias：使用"昨日 close vs 昨日 MA200"判断，避免使用当日收盘
+        - 引入趋势强度打分 equity_ratio ∈ [0, 1]，用于平滑仓位调节
+        - 增加连续信号确认阈值（MIN_CONFIRM_WEEKS），减少震荡市 whipsaw
         """
         # 使用QFQ（前复权）数据计算MA200，避免除权导致的均线失真
         qfq_data = self.all_data.get('qfq', self.all_data)
-        
+
         if '510300' not in qfq_data:
             logger.warning("无法获取沪深300ETF数据，使用当前市场模式")
+            self.equity_ratio = 0.0
             return self.market_mode
-        
+
         df = qfq_data['510300']
         df = df[df['date'] <= pd.to_datetime(date_str)].copy()
-        
-        if len(df) < self.MA200_WINDOW:
+
+        # 需要至少 MA200 + 1 天数据，才能计算"昨日 MA200"和"昨日 close"
+        if len(df) < self.MA200_WINDOW + 1:
+            self.equity_ratio = 0.0
             return self.market_mode
-        
-        df.loc[:, 'ma200'] = df['close'].rolling(window=self.MA200_WINDOW).mean().shift(1)
-        latest_data = df.iloc[-1]
-        
-        close_price = latest_data['close']
-        ma200_price = latest_data['ma200']
-        
-        if close_price > ma200_price:
+
+        df.loc[:, 'ma200'] = df['close'].rolling(window=self.MA200_WINDOW).mean()
+        # 取倒数第二行：昨日 close vs 昨日 MA200（避免使用当日尚未发生的 close）
+        latest_data = df.iloc[-2]
+
+        prev_close = float(latest_data['close'])
+        prev_ma200 = float(latest_data['ma200'])
+
+        if pd.isna(prev_ma200) or prev_ma200 <= 0:
+            self.equity_ratio = 0.0
+            return self.market_mode
+
+        # 趋势偏离度：(close - MA200) / MA200
+        deviation = (prev_close - prev_ma200) / prev_ma200
+
+        # --- 趋势强度打分（平滑过渡，降低震荡回撤） ---
+        # 偏离度 < -0.02：空仓防守
+        # 偏离度 -0.02 ~ +0.02：半仓中性
+        # 偏离度 > +0.05：满仓进攻
+        if deviation < -0.02:
+            self.equity_ratio = 0.0
+            current_signal = 'bear'
+        elif deviation < 0.02:
+            self.equity_ratio = 0.5
+            current_signal = 'neutral'
+        elif deviation < 0.05:
+            self.equity_ratio = 0.8
             current_signal = 'bull'
         else:
-            current_signal = 'bear'
-        
+            self.equity_ratio = 1.0
+            current_signal = 'bull'
+
+        # --- 信号计数 / 延迟确认 ---
+        MIN_CONFIRM_WEEKS = 2  # 需要连续 2 周确认，减少 whipsaw
         if current_signal == 'bull':
             self.bull_signal_count += 1
             self.bear_signal_count = 0
         else:
             self.bear_signal_count += 1
             self.bull_signal_count = 0
-        
-        if self.bull_signal_count >= 1 and self.market_mode != 'bull':
-            logger.info(f"{date_str} 市场模式切换：熊市 -> 牛市 (连续1周信号确认)")
-            self.market_mode = 'bull'
-        elif self.bear_signal_count >= 1 and self.market_mode != 'bear':
-            logger.info(f"{date_str} 市场模式切换：牛市 -> 熊市 (连续1周信号确认)")
-            self.market_mode = 'bear'
-        
+
+        # 从空仓切到满仓需要 MIN_CONFIRM_WEEKS 周连续 bull
+        if current_signal == 'bull' and self.market_mode != 'bull':
+            if self.bull_signal_count >= MIN_CONFIRM_WEEKS:
+                logger.info(
+                    f"{date_str} 市场模式切换：{self.market_mode} -> bull "
+                    f"(连续 {MIN_CONFIRM_WEEKS} 周确认, 偏离度={deviation:.4f})"
+                )
+                self.market_mode = 'bull'
+        elif current_signal == 'bear' and self.market_mode != 'bear':
+            if self.bear_signal_count >= 1:
+                logger.info(
+                    f"{date_str} 市场模式切换：{self.market_mode} -> bear "
+                    f"(偏离度={deviation:.4f})"
+                )
+                self.market_mode = 'bear'
+        # neutral 不主动切换 market_mode，但 equity_ratio 会影响调仓
+
+        logger.debug(
+            f"{date_str} 市场模式判断: close={prev_close:.4f}, "
+            f"MA200={prev_ma200:.4f}, 偏离度={deviation:.4f}, "
+            f"equity_ratio={self.equity_ratio:.2f}, mode={self.market_mode}"
+        )
         return self.market_mode
     
     def run(self):
@@ -118,13 +163,17 @@ class Backtester:
             # 只有在调仓日才执行调仓（每周一次）
             if self.is_rebalance_day(date_str):
                 if self.initial_rebalance_done:
-                    self._weekly_rebalance(date_str, exclude=set(stop_loss_list))
+                    self._weekly_rebalance(
+                        date_str, exclude=set(stop_loss_list),
+                        equity_ratio=getattr(self, 'equity_ratio', 1.0)
+                    )
                 else:
                     logger.info(f"{date_str} 执行初始调仓，当前市场模式: {self.market_mode}")
                     self.portfolio_manager.rebalance(
                         self.all_data, self.etf_pool, date_str,
                         periods_weights=self.periods_weights,
-                        market_mode=self.market_mode
+                        market_mode=self.market_mode,
+                        equity_ratio=getattr(self, 'equity_ratio', 1.0)
                     )
                     self.initial_rebalance_done = True
             
@@ -171,13 +220,17 @@ class Backtester:
         
         return {'triggered': stop_loss_triggered, 'list': stop_loss_list}
     
-    def _weekly_rebalance(self, date_str, exclude=None):
-        logger.info(f"{date_str} 执行周度调仓，当前市场模式: {self.market_mode}")
+    def _weekly_rebalance(self, date_str, exclude=None, equity_ratio=1.0):
+        logger.info(
+            f"{date_str} 执行周度调仓，当前市场模式: {self.market_mode}, "
+            f"equity_ratio={equity_ratio:.2f}"
+        )
         self.portfolio_manager.rebalance(
-            self.all_data, self.etf_pool, date_str, 
+            self.all_data, self.etf_pool, date_str,
             exclude=exclude,
             periods_weights=self.periods_weights,
-            market_mode=self.market_mode
+            market_mode=self.market_mode,
+            equity_ratio=equity_ratio
         )
     
     def get_results_df(self):

@@ -16,7 +16,7 @@ class PortfolioManager:
         self.highest_prices = {}  # 记录每个持仓标的买入以来的最高价
         self.params = params or {}
         self.lookback_days = self.params.get('lookback_days', StrategyConfig.LOOKBACK_DAYS)
-        self.trailing_stop_pct = self.params.get('trailing_stop_pct', 0.08)
+        self.trailing_stop_pct = self.params.get('trailing_stop_pct', 0.15)
     
     def get_current_holdings(self):
         return list(self.positions.keys())
@@ -194,8 +194,10 @@ class PortfolioManager:
         qfq_data = all_data.get('qfq', all_data)
         hfq_data = all_data.get('hfq', all_data)
 
-        # --- 决定目标组合 ---
-        if market_mode == 'bull':
+        # --- 决定目标组合（用 equity_ratio 驱动）---
+        # equity_ratio > 0 → 尝试买入风险资产
+        # equity_ratio = 0.0 → 只持有现金 ETF
+        if equity_ratio > 0:
             target_portfolio = self._get_bull_portfolio(qfq_data, etf_pool, current_date, periods_weights)
         else:
             target_portfolio = []
@@ -207,45 +209,70 @@ class PortfolioManager:
         if StrategyConfig.CASH_ETF_CODE not in target_portfolio:
             target_portfolio.append(StrategyConfig.CASH_ETF_CODE)
 
-        current_holdings = set(self.get_current_holdings())
-        target_holdings = set(target_portfolio)
-
-        to_sell = current_holdings - target_holdings
-
         logger.info(
             f"{current_date} [{market_mode}] 调仓计划 - "
-            f"equity_ratio={equity_ratio:.2f}, 卖出: {list(to_sell)}, 候选买入: {target_portfolio}"
+            f"equity_ratio={equity_ratio:.2f}, 目标持仓: {target_portfolio}"
         )
 
-        # --- 卖出不在目标池的持仓 ---
-        proceeds_cash = 0.0
-        for etf_code in to_sell:
-            if etf_code not in self.positions:
-                continue
-            if not self.can_sell(etf_code, current_date):
-                logger.info(f"{current_date} 无法卖出 {etf_code}: T+1 限制")
+        # --- 简化方案：全仓卖出后重新买入（避免部分持仓/重复扣款混乱）---
+        # Step 1: 卖出所有非目标ETF的持仓 + 多余的国债ETF
+        total_value = self.get_total_value(all_data, current_date)
+        for etf_code in list(self.positions.keys()):
+            if etf_code == StrategyConfig.CASH_ETF_CODE:
+                # 国债 ETF 暂时保留，稍后在买入阶段再统一调整
                 continue
 
+            # 所有风险资产都清仓（稍后按目标权重重新分配买入）
             df = hfq_data.get(etf_code)
             if df is None or df.empty:
-                logger.warning(f"{current_date} 卖出失败: {etf_code} 不在 hfq 数据中")
+                logger.warning(f"{current_date} 卖出失败: {etf_code} 无 hfq 数据")
                 continue
 
-            price = df[df['date'] <= pd.to_datetime(current_date)]['close'].iloc[-1]
+            price_df = df[df['date'] <= pd.to_datetime(current_date)]
+            if len(price_df) < 1:
+                continue
+            price = float(price_df['close'].iloc[-1])
             shares = self.positions[etf_code]
 
             amount = shares * price
             cost = amount * StrategyConfig.TRANSACTION_COST
 
             self.cash += (amount - cost)
-            proceeds_cash += (amount - cost)
             del self.positions[etf_code]
             if etf_code in self.bought_dates:
                 del self.bought_dates[etf_code]
+            if etf_code in self.highest_prices:
+                del self.highest_prices[etf_code]
 
-            logger.info(f"{current_date} 清仓卖出 {etf_code}: {shares} 份 @ {price:.2f}, 获得 {amount - cost:.2f}")
+            logger.info(f"{current_date} 清仓卖出 {etf_code}: {shares} 份 @ {price:.4f}, 获得 {amount - cost:.2f}")
 
-        # --- 执行买入（使用波动率加权 + equity_ratio 控制） ---
+        # Step 2: 卖出多余的国债 ETF，释放现金用于买入风险资产
+        cash_etf_code = StrategyConfig.CASH_ETF_CODE
+        if cash_etf_code in self.positions:
+            desired_cash_etf_value = total_value * (1 - equity_ratio) * 0.97  # 留3%缓冲
+            cash_df = hfq_data.get(cash_etf_code)
+            if cash_df is not None and not cash_df.empty:
+                price_df = cash_df[cash_df['date'] <= pd.to_datetime(current_date)]
+                if len(price_df) >= 1:
+                    price = float(price_df['close'].iloc[-1])
+                    current_cash_etf_value = self.positions[cash_etf_code] * price
+                    if current_cash_etf_value > desired_cash_etf_value:
+                        excess_value = current_cash_etf_value - desired_cash_etf_value
+                        shares_to_sell = int(excess_value / price / 100) * 100
+                        if shares_to_sell > 0:
+                            proceeds = shares_to_sell * price * (1 - StrategyConfig.TRANSACTION_COST)
+                            self.cash += proceeds
+                            self.positions[cash_etf_code] -= shares_to_sell
+                            if self.positions[cash_etf_code] <= 0:
+                                del self.positions[cash_etf_code]
+                                if cash_etf_code in self.bought_dates:
+                                    del self.bought_dates[cash_etf_code]
+                            logger.info(
+                                f"{current_date} 减仓国债ETF: 卖出 {shares_to_sell} 份 @ {price:.4f}, "
+                                f"获得 {proceeds:.2f}"
+                            )
+
+        # --- Step 3: 统一买入（风险资产 × equity_ratio + 国债ETF × (1-equity_ratio)）---
         self._execute_buy(
             all_data, target_portfolio, current_date, market_mode,
             equity_ratio=equity_ratio
@@ -327,9 +354,9 @@ class PortfolioManager:
         # 约束 equity_ratio 范围
         equity_ratio = max(0.0, min(1.0, float(equity_ratio)))
 
-        # 仅在 bull 模式且 equity_ratio > 0 时买入风险资产
+        # 仅在 equity_ratio > 0 时买入风险资产（market_mode 不再作为开关）
         eligible_risk_etfs = []
-        if market_mode == 'bull' and equity_ratio > 0 and risk_etfs:
+        if equity_ratio > 0 and risk_etfs:
             eligible_risk_etfs = [code for code in risk_etfs if code in price_info]
 
         risk_weights = {}

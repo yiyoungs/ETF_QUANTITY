@@ -14,7 +14,7 @@ class Backtester:
         self.params = params or {}
         self.backtest_config = backtest_config or DEFAULT_BACKTEST_CONFIG
         self.lookback_days = self.params.get('lookback_days', StrategyConfig.LOOKBACK_DAYS)
-        self.trailing_stop_pct = self.params.get('trailing_stop_pct', 0.08)
+        self.trailing_stop_pct = self.params.get('trailing_stop_pct', 0.15)
         
         self.periods_weights = self.params.get('periods_weights', None)
         

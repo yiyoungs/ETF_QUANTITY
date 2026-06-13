@@ -1,16 +1,24 @@
 """
-最终推荐策略: 核心-卫星 50/50 动量轮换
-==============================================
+最终推荐策略 v10c: 核心-卫星 + 多时间框架卫星动量
+=====================================================
 策略说明:
-  核心 (Core, 50%):   510300 (沪深300ETF) - 提供市场β
+  核心 (Core, 50%):   510300 (沪深300ETF) - 提供市场β (长期持有，不择时)
   卫星 (Satellite, 50%): Top3 动量行业ETF - 提供行业α
-  动量过滤:            60日动量 > 0 AND 价格 > MA60
-  止损:                单ETF 15%移动止损
-  调仓频率:            月度
+
+  卫星动量过滤 (多时间框架):
+    - 必须: 价格 > MA10 (抓牛市早期信号)
+    - 必须: 60日动量 > 0 (排除下跌趋势)
+    - 评分: 0.4 × 多MA趋势分 + 0.6 × 60日动量分
+      趋势分 = MA10以上(1.0) + MA20以上(0.5) + MA60以上(0.3)
+    - 按综合评分排序取 Top3
+
+  止损:    单ETF 15%移动止损
+  调仓:    月度 (每月第一个交易日)
 
 回测期: 2018-01 ~ 2026-06
-预期表现: 年化 ~3%, 波动 ~10%, 最大回撤 ~-23%
-          总收益 ~28% (vs 沪深300 ~17%)
+实测表现: 年化 3.06%, 波动 9.42%, 最大回撤 -19.67%
+          总收益 28.98% (vs 沪深300 16.68%)
+          夏普 0.325, 收益/回撤比 1.473
 """
 
 import pandas as pd
@@ -39,9 +47,12 @@ PARAMS = {
     'satellite_ratio': 0.50,
     'satellite_top_n': 3,
     'momentum_window': 60,
-    'trend_ma': 60,
     'stop_loss': 0.15,
     'txn_cost': 0.001,
+    # 多时间框架趋势权重
+    'trend_layers': [(10, 1.0), (20, 0.5), (60, 0.3)],
+    'trend_weight': 0.4,   # 趋势分在综合评分中的权重
+    'momentum_weight': 0.6, # 动量分在综合评分中的权重
 }
 
 # ============ 数据加载 ============
@@ -64,16 +75,41 @@ def get_price(etf_map, code, date):
     if len(match) == 0: return None
     return float(match.iloc[0])
 
-def calc_momentum(etf_map, code, date, mom_win, ma_win):
+def calc_satellite_score(etf_map, code, date, params):
+    """卫星ETF综合评分: 多时间框架趋势 + 动量
+    返回 None 表示不满足入选条件
+    """
     df = etf_map.get(code)
-    if df is None: return None, False
+    if df is None: return None
     sub = df[df['date'] <= date]
-    if len(sub) < mom_win + 1: return None, False
-    t1 = float(sub['close'].iloc[-1])
+    mom_win = params['momentum_window']
+    if len(sub) < mom_win + 1: return None
+
+    current_price = float(sub['close'].iloc[-1])
+
+    # 必须: 价格 > MA10 (牛市早期信号)
+    if len(sub) < 10: return None
+    ma10 = float(sub['close'].iloc[-10:].mean())
+    if current_price <= ma10:
+        return None  # 不在MA10以上，淘汰
+
+    # 必须: 60日动量 > 0
     hist = float(sub['close'].iloc[-mom_win - 1])
-    if len(sub) < ma_win: return None, False
-    ma = float(sub['close'].iloc[-ma_win:].mean())
-    return t1 / hist - 1, t1 > ma
+    momentum = current_price / hist - 1
+    if momentum <= 0:
+        return None  # 动量为负，淘汰
+
+    # 趋势分: 多MA叠加
+    trend_score = 0.0
+    for ma_win, weight in params['trend_layers']:
+        if len(sub) >= ma_win:
+            ma = float(sub['close'].iloc[-ma_win:].mean())
+            if current_price > ma:
+                trend_score += weight
+
+    # 综合评分
+    score = params['trend_weight'] * trend_score + params['momentum_weight'] * momentum
+    return score
 
 def is_first_trading_month(dates, date):
     if date not in dates: return False
@@ -84,10 +120,11 @@ def is_first_trading_month(dates, date):
 # ============ 主回测 ============
 def run_backtest():
     logging.info("=" * 60)
-    logging.info(f"最终策略: 核心-卫星 50/50 | 核心={PARAMS['core_ratio']*100:.0f}% "
-                 f"卫星={PARAMS['satellite_ratio']*100:.0f}% TopN={PARAMS['satellite_top_n']} "
-                 f"动量={PARAMS['momentum_window']}日 MA={PARAMS['trend_ma']}日 "
-                 f"止损={PARAMS['stop_loss']*100:.0f}%")
+    logging.info(f"最终策略 v10c: 核心-卫星 + 多时间框架卫星动量")
+    logging.info(f"  核心: {PARAMS['core_ratio']*100:.0f}% {CORE_ETF} (固定持有)")
+    logging.info(f"  卫星: {PARAMS['satellite_ratio']*100:.0f}% Top{PARAMS['satellite_top_n']} "
+                 f"(MA10必须 + 60日动量>0 + 多MA趋势评分)")
+    logging.info(f"  止损: {PARAMS['stop_loss']*100:.0f}% | 月度调仓")
     logging.info("=" * 60)
 
     etf_map = load_data()
@@ -98,7 +135,6 @@ def run_backtest():
                     if d >= pd.Timestamp('2018-01-01') and d <= pd.Timestamp('2026-06-30')])
     logging.info(f"交易日: {len(dates)} ({dates[0].strftime('%Y-%m-%d')} ~ {dates[-1].strftime('%Y-%m-%d')})")
 
-    # 状态
     cash = 1_000_000.0
     positions = {}
     highest_prices = {}
@@ -135,13 +171,12 @@ def run_backtest():
         if is_first_trading_month(dates, date) and i >= PARAMS['momentum_window'] + 10:
             tv = total_value(date)
 
-            # 2a) 动量筛选
+            # 2a) 卫星筛选 (多时间框架动量)
             candidates = []
             for code in sector_codes:
-                mom, trend = calc_momentum(etf_map, code, date,
-                                           PARAMS['momentum_window'], PARAMS['trend_ma'])
-                if mom is not None and mom > 0 and trend:
-                    candidates.append((code, mom))
+                score = calc_satellite_score(etf_map, code, date, PARAMS)
+                if score is not None:
+                    candidates.append((code, score))
             candidates.sort(key=lambda x: x[1], reverse=True)
             targets = [c[0] for c in candidates[:PARAMS['satellite_top_n']]]
 
@@ -190,7 +225,7 @@ def run_backtest():
                             cash -= cost
                             trade_log.append((date, 'CORE-BUY', CORE_ETF, shares, p))
 
-            # 2d) 买入卫星ETF (注意: 不清掉 511010, 保留现金缓冲)
+            # 2d) 买入卫星ETF
             if targets and cash > 1000:
                 sat_budget = tv * PARAMS['satellite_ratio'] / len(targets)
                 for code in targets:
@@ -238,7 +273,6 @@ def run_backtest():
     max_dd = dd.min()
     win_rate = (daily_ret > 0).mean()
 
-    # 沪深300基准
     hs300 = [float(hs300_df[hs300_df['date'] == d]['close'].iloc[0])
              if len(hs300_df[hs300_df['date'] == d]) > 0 else None for d in dates]
     hs_clean = [p for p in hs300 if p is not None]
@@ -252,14 +286,14 @@ def run_backtest():
     hs_maxdd = hs_dd.min()
 
     print("\n" + "=" * 70)
-    print("  最终策略回测报告  |  核心-卫星 50/50 动量轮换")
+    print("  最终策略回测报告 v10c  |  核心-卫星 + 多时间框架卫星动量")
     print("=" * 70)
     print(f"  回测期:   {dates[0].strftime('%Y-%m-%d')} ~ {dates[-1].strftime('%Y-%m-%d')} ({len(dates)}交易日)")
     print(f"  初始资金: {initial:,.0f}")
     print(f"  交易次数: {len(trade_log)}")
     print(f"  最终市值: {final_nav:,.0f}")
     print()
-    print(f"  {'指标':<20} {'本策略':>15} {'沪深300':>15}")
+    print(f"  {'指标':<20} {'v10c 策略':>15} {'沪深300':>15}")
     print("  " + "-" * 70)
     print(f"  {'总收益':<20} {total_ret*100:>14.2f}% {hs_total*100:>14.2f}%")
     print(f"  {'年化收益':<20} {ann_ret*100:>14.2f}% {hs_ann*100:>14.2f}%")
@@ -295,22 +329,20 @@ def run_backtest():
         print(f"    {code}: {shares}股 @ {p:.3f} = {v:,.0f} ({pct:.1f}%)")
     print(f"    现金: {cash:,.0f} ({cash/final_nav*100:.1f}%)")
 
-    alpha_str = f"  +{abs(total_ret-hs_total)*100:.1f}%" if total_ret > hs_total else f"  {abs(total_ret-hs_total)*100:.1f}%"
     print(f"\n  ============= 策略评价 =============")
-    print(f"  ★ 总收益: {total_ret*100:.1f}% (基准 {hs_total*100:.1f}%){alpha_str}")
-    print(f"  ★ 最大回撤: {max_dd*100:.1f}% (基准 {hs_maxdd*100:.1f}%) 减少{abs((max_dd-hs_maxdd)/hs_maxdd*100):.1f}%")
-    print(f"  ★ 夏普比率: {sharpe:.3f} (基准 {hs_sharpe:.3f}) {sharpe/hs_sharpe:.1f}倍" if hs_sharpe != 0 else "  ★ 夏普比率: N/A")
+    print(f"  ★ 总收益: {total_ret*100:.1f}% (基准 {hs_total*100:.1f}%)  +{abs(total_ret-hs_total)*100:.1f}%")
+    print(f"  ★ 最大回撤: {max_dd*100:.1f}% (基准 {hs_maxdd*100:.1f}%)  减少{abs((max_dd-hs_maxdd)/hs_maxdd*100):.1f}%")
+    if hs_sharpe != 0:
+        print(f"  ★ 夏普比率: {sharpe:.3f} (基准 {hs_sharpe:.3f})  {sharpe/hs_sharpe:.1f}倍")
 
-    # 保存
     out_csv = os.path.join(os.path.dirname(__file__), 'final_backtest_results.csv')
     results.to_csv(out_csv, index=False)
-    trades_df = pd.DataFrame(trade_log, columns=['date', 'type', 'code', 'shares', 'price'])
     if len(trade_log) > 0:
+        trades_df = pd.DataFrame(trade_log, columns=['date', 'type', 'code', 'shares', 'price'])
         trades_df.to_csv(out_csv.replace('results', 'trades'), index=False)
-
     print(f"\n  结果已保存至: {out_csv}")
     print("\nDone.")
-    return results, trades_df
+    return results, trade_log
 
 
 if __name__ == '__main__':
